@@ -1,0 +1,316 @@
+package qfdb
+
+import (
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/codingeasygo/util/xmap"
+	"github.com/codingeasygo/web"
+	"github.com/wfunc/go/define"
+	"github.com/wfunc/go/xlog"
+	"golang.org/x/net/websocket"
+)
+
+var PushShared *Push
+
+func PushBootstrap() {
+	PushShared = NewPush()
+	PushShared.Start()
+}
+
+type Push struct {
+	WaitTimeout  time.Duration
+	NotifyRunner int
+	OnConnect    func(conn *websocket.Conn)
+	OnDisconnect func(conn *websocket.Conn)
+	wsconn       map[string]*PushConn
+	wslock       sync.RWMutex
+	exiter       chan int
+	waiter       sync.WaitGroup
+	// OrderQueue    chan *Order
+	// OrderLock     sync.RWMutex
+	// WithdrawQueue chan *Withdraw
+	// WithdrawLock  sync.RWMutex
+	TickerDelay time.Duration
+}
+
+func NewPush() (push *Push) {
+	return &Push{
+		WaitTimeout:  3 * time.Second,
+		TickerDelay:  2 * time.Second,
+		NotifyRunner: 1,
+		wsconn:       map[string]*PushConn{},
+		wslock:       sync.RWMutex{},
+		exiter:       make(chan int, 1024),
+		waiter:       sync.WaitGroup{},
+		// OrderQueue:    make(chan *Order, 1024),
+		// OrderLock:     sync.RWMutex{},
+		// WithdrawQueue: make(chan *Withdraw, 1024),
+		// WithdrawLock:  sync.RWMutex{},
+	}
+}
+
+func (p *Push) Start() {
+	p.waiter.Add(1)
+	go p.loopTicker()
+	for i := 0; i < p.NotifyRunner; i++ {
+		p.waiter.Add(1)
+		go p.loopNotify()
+	}
+}
+
+func (p *Push) Stop() {
+	p.exiter <- 0
+	for i := 0; i < p.NotifyRunner; i++ {
+		p.exiter <- 0
+	}
+	p.waiter.Wait()
+}
+
+func (p *Push) loopNotify() {
+	defer p.waiter.Done()
+	running := true
+	xlog.Infof("Push notify runner is starting")
+	for running {
+		select {
+		case <-p.exiter:
+			running = false
+			// case item := <-p.OrderQueue:
+			// p.procNotifyOrder(item)
+			// case item := <-p.WithdrawQueue:
+			// p.procNotifyWithdraw(item)
+		}
+	}
+	xlog.Infof("Push notify runner is stopped")
+}
+
+func (p *Push) loopTicker() {
+	defer p.waiter.Done()
+	ticker := time.NewTicker(p.TickerDelay)
+	defer ticker.Stop()
+	running := true
+	xlog.Infof("Push loopTicker is starting")
+	for running {
+		select {
+		case <-p.exiter:
+			running = false
+		case <-ticker.C:
+			p.procTicker()
+		}
+	}
+	xlog.Infof("Push loopTicker is stopped")
+}
+
+func (p *Push) procTicker() {
+	p.wslock.Lock()
+	defer p.wslock.Unlock()
+	for _, conn := range p.wsconn {
+		if !conn.Ready && time.Since(conn.Latest) > p.WaitTimeout {
+			conn.Close()
+			continue
+		}
+		if conn.Ready && time.Since(conn.PingLatest) > 15*time.Second {
+			now := time.Now()
+			var err = conn.Send(xmap.M{"action": "ping", "timestamp": now.UnixMilli()})
+			if err != nil {
+				xlog.Errorf("procTicker send ping error:%v", err)
+				conn.Close()
+			} else {
+				conn.PingLatest = now
+			}
+		}
+	}
+}
+
+// func (p *Push) procNotifyOrder(order *Order) (err error) {
+// 	xlog.Infof("procNotifyOrder:%v", order)
+// 	p.wslock.RLock()
+// 	defer p.wslock.RUnlock()
+// 	notify := xmap.M{
+// 		"action": "notify.order",
+// 		"order":  order,
+// 		"code":   define.Success,
+// 	}
+
+// 	for _, conn := range p.wsconn {
+// 		err = conn.Send(notify)
+// 		if err != nil {
+// 			xlog.Errorf("procNotifyOrder send order notify error:%v", err)
+// 			conn.Close()
+// 			break
+// 		}
+// 	}
+// 	return
+// }
+
+// func (p *Push) procNotifyWithdraw(withdraw *Withdraw) (err error) {
+// 	p.wslock.RLock()
+// 	defer p.wslock.RUnlock()
+
+// 	notify := xmap.M{
+// 		"action":   "notify.withdraw",
+// 		"withdraw": withdraw,
+// 		"code":     define.Success,
+// 	}
+
+// 	for _, conn := range p.wsconn {
+// 		err = conn.Send(notify)
+// 		if err != nil {
+// 			xlog.Errorf("procNotifyWithdraw send withdraw notify error:%v", err)
+// 			conn.Close()
+// 			break
+// 		}
+// 	}
+// 	return
+// }
+
+func (p *Push) SrvHTTP(s *web.Session) web.Result {
+	srv := websocket.Server{Handler: p.HandWs}
+	srv.ServeHTTP(s.W, s.R)
+	return web.Return
+}
+
+func (p *Push) HandWs(raw *websocket.Conn) {
+	var err error
+	conn := NewPushConn(raw)
+	key := fmt.Sprintf("%p", conn)
+	p.wslock.Lock()
+	p.wsconn[key] = conn
+	p.wslock.Unlock()
+	defer func() {
+		p.wslock.Lock()
+		delete(p.wsconn, key)
+		p.wslock.Unlock()
+		if p.OnDisconnect != nil {
+			p.OnDisconnect(raw)
+		}
+		conn.Close()
+	}()
+	if p.OnConnect != nil {
+		p.OnConnect(raw)
+	}
+	xlog.Infof("Push accept ws from %v", raw.Request().RemoteAddr)
+	for {
+		cmd := xmap.M{}
+		err = conn.Receive(&cmd)
+		if err != nil {
+			break
+		}
+		if len(cmd) < 1 {
+			continue
+		}
+		action := cmd.StrDef("", "action")
+		switch action {
+		case "sub.push":
+			err = p.handPush(conn)
+		default:
+			conn.Send(xmap.M{
+				"action":  "error",
+				"code":    define.ArgsInvalid,
+				"message": "unknow action",
+			})
+			err = fmt.Errorf("unknow action")
+		}
+		if err != nil {
+			break
+		}
+	}
+	xlog.Infof("Push ws from %v is closed by %v", raw.Request().RemoteAddr, err)
+}
+
+func (p *Push) handPush(conn *PushConn) (err error) {
+	conn.Ready = true
+	conn.PingLatest = time.Now()
+	xlog.Infof("Push ws from %v is ready for push", conn.RemoteAddr())
+	err = conn.Send(xmap.M{
+		"action": "sub.push",
+		"code":   define.Success,
+	})
+	return
+}
+
+type PushConn struct {
+	Conn       *websocket.Conn
+	Codec      *websocket.Codec
+	Timeout    time.Duration
+	Ready      bool
+	Latest     time.Time
+	PingLatest time.Time
+}
+
+func NewPushConn(conn *websocket.Conn) (pc *PushConn) {
+	pc = &PushConn{
+		Conn:    conn,
+		Timeout: 3 * time.Second,
+		Latest:  time.Now(),
+	}
+	pc.Codec = &websocket.Codec{
+		Marshal:   pc.codecMarshal,
+		Unmarshal: pc.codecUnmarshal,
+	}
+	return
+}
+
+func (p *PushConn) codecMarshal(v interface{}) (data []byte, payloadType byte, err error) {
+	if s, ok := v.(string); ok {
+		switch s {
+		case "PING":
+			payloadType = websocket.PingFrame
+			return
+		case "PONG":
+			payloadType = websocket.PongFrame
+			return
+		default:
+			payloadType = websocket.TextFrame
+			data = []byte(s)
+		}
+	} else {
+		payloadType = websocket.TextFrame
+		data, err = json.Marshal(v)
+	}
+	return
+}
+
+func (p *PushConn) codecUnmarshal(data []byte, payloadType byte, v interface{}) (err error) {
+	p.Latest = time.Now()
+	switch payloadType {
+	case websocket.PingFrame, websocket.PongFrame:
+	default:
+		err = json.Unmarshal(data, v)
+	}
+	return
+}
+
+func (p *PushConn) Send(v interface{}) (err error) {
+	if p.Conn == nil {
+		err = fmt.Errorf("%v", "send not connected")
+		return
+	}
+	p.Conn.SetWriteDeadline(time.Now().Add(p.Timeout))
+	err = p.Codec.Send(p.Conn, v)
+	return
+}
+
+func (p *PushConn) Receive(v interface{}) (err error) {
+	if p.Conn == nil {
+		err = fmt.Errorf("%v", "recv not connected")
+		return
+	}
+	err = p.Codec.Receive(p.Conn, v)
+	return
+}
+
+func (p *PushConn) Close() (err error) {
+	if p.Conn == nil {
+		err = fmt.Errorf("%v", "close not connected")
+		return
+	}
+	err = p.Conn.Close()
+	return
+}
+
+func (p *PushConn) RemoteAddr() string {
+	return p.Conn.Request().RemoteAddr
+}
